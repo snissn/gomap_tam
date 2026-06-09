@@ -75,6 +75,24 @@ TDB_BENCH_TRANSPORTS="treedb_iceoryx" benchmarks/treedb_transport_baseline.sh
 TDB_BENCH_TRANSPORTS="treedb_pg_shmem" benchmarks/treedb_transport_baseline.sh
 ```
 
+## PG-shmem lifecycle smoke
+
+For lifecycle-hardening changes, run the bounded smoke script after
+`make install`. It starts a fresh temporary PostgreSQL cluster with
+`treedb.pg_shmem_enabled=on` and archives normal, bgworker restart, and slot
+exhaustion/cleanup evidence:
+
+```bash
+TDB_LIFECYCLE_OUT="artifacts/tam_lifecycle/$(date -u +%Y%m%dT%H%M%SZ)" \
+  benchmarks/treedb_pg_shmem_lifecycle_smoke.sh
+```
+
+Use `TDB_LIFECYCLE_MODES="normal slot_exhaustion"` for a shorter failure smoke,
+or `TDB_LIFECYCLE_KEEP_CLUSTER=1` to keep the temporary cluster for inspection.
+The script is bounded with per-psql timeouts when `gtimeout` or `timeout` is
+available and writes `environment.txt`, `commands.log`, `postgres.log`, and
+mode-specific logs under the artifact directory.
+
 ## Artifacts to attach or cite
 
 Each run writes:

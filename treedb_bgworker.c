@@ -5,9 +5,12 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h"
+#include "storage/procnumber.h"
 #include "storage/shmem.h"
 #include "utils/memutils.h"
 #include "utils/guc.h"
+#include "utils/timestamp.h"
 
 #include "access/xact.h"
 #include "catalog/objectaccess.h"
@@ -67,11 +70,12 @@ static const struct config_enum_entry treedb_transport_options[] = {
 #define TDB_PG_SHMEM_NAME            "treedb_pgext pg-shmem rpc"
 #define TDB_PG_SHMEM_LWLOCK_TRANCHE  "treedb_pgext_pg_shmem"
 #define TDB_PG_SHMEM_MAGIC           0x54444253U /* TDBS */
-#define TDB_PG_SHMEM_VERSION         1U
+#define TDB_PG_SHMEM_VERSION         2U
 #define TDB_PG_SHMEM_SLOT_COUNT      64U
 #define TDB_PG_SHMEM_DRAIN_BATCH     32U       /* Fairness: check iceoryx between batches. */
 #define TDB_PG_SHMEM_WORKER_RETRIES  100       /* 100 x 100 ms = 10 s */
 #define TDB_PG_SHMEM_WAIT_MS         1000L
+#define TDB_PG_SHMEM_RPC_TIMEOUT_MS  ((long) TDB_RPC_RESPONSE_TIMEOUT_SEC * 1000L)
 
 #define TDB_PG_SLOT_FREE        0U
 #define TDB_PG_SLOT_IDLE        1U
@@ -81,32 +85,53 @@ static const struct config_enum_entry treedb_transport_options[] = {
 
 typedef struct TDBPgShmemSlot
 {
-    uint32  state;
-    uint32  generation;
-    int     owner_pid;
-    Latch  *owner_latch;
+    uint32      state;
+    uint32      generation;          /* Bumped on every submit/release to reject stale completions. */
+    uint32      worker_generation;   /* Worker epoch that accepted this request. */
+    int         owner_pid;
+    ProcNumber  owner_proc_number;
+    Latch      *owner_latch;
+    TimestampTz submitted_at;
+    TimestampTz processing_at;
+    TimestampTz completed_at;
 
-    uint8   opcode;
-    uint32  req_len;
-    uint8   req[TDB_MAX_REQ_PAYLOAD];
+    uint8       opcode;
+    uint32      req_len;
+    uint8       req[TDB_MAX_REQ_PAYLOAD];
 
-    uint8   status;
-    uint32  resp_len;
-    uint8   resp[TDB_MAX_RESP_PAYLOAD];
+    uint8       status;
+    uint32      resp_len;
+    uint8       resp[TDB_MAX_RESP_PAYLOAD];
 } TDBPgShmemSlot;
 
 typedef struct TDBPgShmemState
 {
-    uint32  magic;
-    uint32  version;
-    uint32  slot_count;
-    uint32  req_capacity;
-    uint32  resp_capacity;
+    uint32      magic;
+    uint32      version;
+    uint32      slot_count;
+    uint32      req_capacity;
+    uint32      resp_capacity;
 
-    uint32  next_generation;
-    int     worker_pid;
-    Latch  *worker_latch;
-    bool    worker_ready;
+    uint32      next_generation;
+    uint32      next_worker_generation;
+    uint32      worker_generation;
+    int         worker_pid;
+    ProcNumber  worker_proc_number;
+    Latch      *worker_latch;
+    bool        worker_ready;
+    TimestampTz worker_started_at;
+
+    uint64      requests_submitted;
+    uint64      requests_completed;
+    uint64      requests_failed;
+    uint64      request_timeouts;
+    uint64      request_aborts;
+    uint64      slot_reclaims;
+    uint64      slot_exhaustions;
+    uint64      stale_completions;
+    uint64      worker_restarts;
+    uint64      max_request_bytes;
+    uint64      max_response_bytes;
 
     TDBPgShmemSlot slots[TDB_PG_SHMEM_SLOT_COUNT];
 } TDBPgShmemState;
@@ -116,6 +141,7 @@ static LWLockPadded    *tdb_pg_shmem_lwlocks = NULL;
 static int              tdb_pg_shmem_slot_index = -1;
 static uint32           tdb_pg_shmem_slot_generation = 0;
 static bool             tdb_pg_shmem_exit_registered = false;
+static uint32           tdb_pg_shmem_worker_generation = 0;
 
 static void
 tdb_sigterm_handler(SIGNAL_ARGS)
@@ -151,16 +177,111 @@ tdb_pid_alive(int pid)
     return errno != ESRCH;
 }
 
+static const char *
+tdb_pg_shmem_state_name(uint32 state)
+{
+    switch (state)
+    {
+        case TDB_PG_SLOT_FREE:       return "FREE";
+        case TDB_PG_SLOT_IDLE:       return "IDLE";
+        case TDB_PG_SLOT_READY:      return "READY";
+        case TDB_PG_SLOT_PROCESSING: return "PROCESSING";
+        case TDB_PG_SLOT_DONE:       return "DONE";
+        default:                     return "UNKNOWN";
+    }
+}
+
+static uint32
+tdb_pg_shmem_next_u32_locked(uint32 *next)
+{
+    uint32 generation = *next;
+
+    if (generation == 0)
+        generation = 1;
+    *next = generation + 1;
+    if (*next == 0)
+        *next = 1;
+    return generation;
+}
+
+static uint32
+tdb_pg_shmem_next_slot_generation_locked(void)
+{
+    return tdb_pg_shmem_next_u32_locked(&tdb_pg_shmem_state->next_generation);
+}
+
+static uint32
+tdb_pg_shmem_next_worker_generation_locked(void)
+{
+    return tdb_pg_shmem_next_u32_locked(&tdb_pg_shmem_state->next_worker_generation);
+}
+
+static bool
+tdb_pg_shmem_owner_alive_locked(const TDBPgShmemSlot *slot)
+{
+    if (slot->owner_pid <= 0 || slot->owner_latch == NULL ||
+        slot->owner_proc_number == INVALID_PROC_NUMBER)
+        return false;
+    if (slot->owner_latch->owner_pid != slot->owner_pid)
+        return false;
+    return tdb_pid_alive(slot->owner_pid);
+}
+
+static bool
+tdb_pg_shmem_slot_owned_by_me_locked(const TDBPgShmemSlot *slot)
+{
+    return slot->owner_pid == MyProcPid &&
+           slot->owner_proc_number == MyProcNumber &&
+           slot->generation == tdb_pg_shmem_slot_generation;
+}
+
+static void
+tdb_pg_shmem_clear_payload_locked(TDBPgShmemSlot *slot)
+{
+    slot->worker_generation = 0;
+    slot->opcode            = 0;
+    slot->req_len           = 0;
+    slot->status            = TDB_STATUS_ERROR;
+    slot->resp_len          = 0;
+    slot->submitted_at      = 0;
+    slot->processing_at     = 0;
+    slot->completed_at      = 0;
+}
+
 static void
 tdb_pg_shmem_reset_slot_locked(TDBPgShmemSlot *slot)
 {
-    slot->state       = TDB_PG_SLOT_FREE;
-    slot->owner_pid   = 0;
-    slot->owner_latch = NULL;
-    slot->opcode      = 0;
-    slot->req_len     = 0;
-    slot->status      = TDB_STATUS_ERROR;
-    slot->resp_len    = 0;
+    slot->generation        = tdb_pg_shmem_next_slot_generation_locked();
+    slot->state             = TDB_PG_SLOT_FREE;
+    slot->owner_pid         = 0;
+    slot->owner_proc_number = INVALID_PROC_NUMBER;
+    slot->owner_latch       = NULL;
+    tdb_pg_shmem_clear_payload_locked(slot);
+}
+
+static void
+tdb_pg_shmem_release_owned_slot_locked(TDBPgShmemSlot *slot)
+{
+    slot->generation        = tdb_pg_shmem_next_slot_generation_locked();
+    slot->state             = TDB_PG_SLOT_IDLE;
+    slot->owner_pid         = MyProcPid;
+    slot->owner_proc_number = MyProcNumber;
+    slot->owner_latch       = MyLatch;
+    tdb_pg_shmem_clear_payload_locked(slot);
+    tdb_pg_shmem_slot_generation = slot->generation;
+}
+
+static bool
+tdb_pg_shmem_reclaim_dead_owner_locked(TDBPgShmemSlot *slot)
+{
+    if (slot->state == TDB_PG_SLOT_FREE || slot->owner_pid <= 0)
+        return false;
+    if (tdb_pg_shmem_owner_alive_locked(slot))
+        return false;
+
+    tdb_pg_shmem_reset_slot_locked(slot);
+    tdb_pg_shmem_state->slot_reclaims++;
+    return true;
 }
 
 static void
@@ -172,9 +293,102 @@ tdb_pg_shmem_set_error_locked(TDBPgShmemSlot *slot, const char *msg)
         msglen = TDB_MAX_RESP_PAYLOAD;
     if (msglen > 0)
         memcpy(slot->resp, msg, msglen);
-    slot->status   = TDB_STATUS_ERROR;
-    slot->resp_len = msglen;
-    slot->state    = TDB_PG_SLOT_DONE;
+    slot->status       = TDB_STATUS_ERROR;
+    slot->resp_len     = msglen;
+    slot->completed_at = GetCurrentTimestamp();
+    slot->state        = TDB_PG_SLOT_DONE;
+    tdb_pg_shmem_state->requests_failed++;
+    if (msglen > tdb_pg_shmem_state->max_response_bytes)
+        tdb_pg_shmem_state->max_response_bytes = msglen;
+}
+
+static int
+tdb_pg_shmem_fail_active_slots_locked(const char *msg,
+                                      uint32 worker_generation,
+                                      Latch **wake_latches,
+                                      int max_wake_latches)
+{
+    int nwake = 0;
+
+    for (uint32 i = 0; i < tdb_pg_shmem_state->slot_count; i++)
+    {
+        TDBPgShmemSlot *slot = &tdb_pg_shmem_state->slots[i];
+
+        if (slot->state != TDB_PG_SLOT_READY &&
+            slot->state != TDB_PG_SLOT_PROCESSING)
+            continue;
+        if (worker_generation != 0 && slot->worker_generation != worker_generation)
+            continue;
+
+        if (!tdb_pg_shmem_owner_alive_locked(slot))
+        {
+            tdb_pg_shmem_reset_slot_locked(slot);
+            tdb_pg_shmem_state->slot_reclaims++;
+            continue;
+        }
+
+        tdb_pg_shmem_set_error_locked(slot, msg);
+        if (slot->owner_latch != NULL && nwake < max_wake_latches)
+            wake_latches[nwake++] = slot->owner_latch;
+    }
+
+    return nwake;
+}
+
+static void
+tdb_pg_shmem_wake_latches(Latch **latches, int nlatches)
+{
+    for (int i = 0; i < nlatches; i++)
+    {
+        if (latches[i] != NULL)
+            SetLatch(latches[i]);
+    }
+}
+
+typedef struct TDBPgShmemSlotStats
+{
+    uint32 free_count;
+    uint32 idle_count;
+    uint32 ready_count;
+    uint32 processing_count;
+    uint32 done_count;
+    uint32 stale_owner_count;
+    long   oldest_active_ms;
+} TDBPgShmemSlotStats;
+
+static void
+tdb_pg_shmem_collect_slot_stats_locked(TDBPgShmemSlotStats *stats)
+{
+    TimestampTz now = GetCurrentTimestamp();
+
+    memset(stats, 0, sizeof(*stats));
+    for (uint32 i = 0; i < tdb_pg_shmem_state->slot_count; i++)
+    {
+        TDBPgShmemSlot *slot = &tdb_pg_shmem_state->slots[i];
+
+        switch (slot->state)
+        {
+            case TDB_PG_SLOT_FREE:       stats->free_count++; break;
+            case TDB_PG_SLOT_IDLE:       stats->idle_count++; break;
+            case TDB_PG_SLOT_READY:      stats->ready_count++; break;
+            case TDB_PG_SLOT_PROCESSING: stats->processing_count++; break;
+            case TDB_PG_SLOT_DONE:       stats->done_count++; break;
+            default: break;
+        }
+
+        if (slot->state != TDB_PG_SLOT_FREE && slot->owner_pid > 0 &&
+            !tdb_pg_shmem_owner_alive_locked(slot))
+            stats->stale_owner_count++;
+
+        if ((slot->state == TDB_PG_SLOT_READY ||
+             slot->state == TDB_PG_SLOT_PROCESSING) &&
+            slot->submitted_at != 0)
+        {
+            long age_ms = TimestampDifferenceMilliseconds(slot->submitted_at, now);
+            if (age_ms > stats->oldest_active_ms)
+                stats->oldest_active_ms = age_ms;
+        }
+    }
 }
 
 static void
@@ -215,6 +429,8 @@ tdb_pg_shmem_startup(void)
         tdb_pg_shmem_state->req_capacity  = TDB_MAX_REQ_PAYLOAD;
         tdb_pg_shmem_state->resp_capacity = TDB_MAX_RESP_PAYLOAD;
         tdb_pg_shmem_state->next_generation = 1;
+        tdb_pg_shmem_state->next_worker_generation = 1;
+        tdb_pg_shmem_state->worker_proc_number = INVALID_PROC_NUMBER;
         for (uint32 i = 0; i < TDB_PG_SHMEM_SLOT_COUNT; i++)
             tdb_pg_shmem_reset_slot_locked(&tdb_pg_shmem_state->slots[i]);
     }
@@ -236,13 +452,10 @@ tdb_pg_shmem_backend_exit(int code, Datum arg)
     lock = tdb_pg_shmem_lock();
     LWLockAcquire(lock, LW_EXCLUSIVE);
     slot = &tdb_pg_shmem_state->slots[tdb_pg_shmem_slot_index];
-    if (slot->owner_pid == MyProcPid &&
-        slot->generation == tdb_pg_shmem_slot_generation)
+    if (tdb_pg_shmem_slot_owned_by_me_locked(slot))
     {
-        if (slot->state == TDB_PG_SLOT_PROCESSING)
-            slot->owner_latch = NULL; /* worker will finish; next backend can reclaim */
-        else
-            tdb_pg_shmem_reset_slot_locked(slot);
+        tdb_pg_shmem_reset_slot_locked(slot);
+        tdb_pg_shmem_state->slot_reclaims++;
     }
     LWLockRelease(lock);
 
@@ -266,13 +479,12 @@ tdb_pg_shmem_error_cleanup(int code, Datum arg)
     lock = tdb_pg_shmem_lock();
     LWLockAcquire(lock, LW_EXCLUSIVE);
     slot = &tdb_pg_shmem_state->slots[slot_index];
-    if (slot->owner_pid == MyProcPid &&
-        slot->generation == tdb_pg_shmem_slot_generation &&
-        slot->state != TDB_PG_SLOT_PROCESSING)
+    if (tdb_pg_shmem_slot_owned_by_me_locked(slot) &&
+        slot->state != TDB_PG_SLOT_IDLE &&
+        slot->state != TDB_PG_SLOT_FREE)
     {
-        slot->state    = TDB_PG_SLOT_IDLE;
-        slot->req_len  = 0;
-        slot->resp_len = 0;
+        tdb_pg_shmem_release_owned_slot_locked(slot);
+        tdb_pg_shmem_state->request_aborts++;
     }
     LWLockRelease(lock);
 }
@@ -281,6 +493,8 @@ static void
 tdb_pg_shmem_worker_exit(int code, Datum arg)
 {
     LWLock *lock;
+    Latch  *wake_latches[TDB_PG_SHMEM_SLOT_COUNT];
+    int     nwake = 0;
 
     (void) code;
     (void) arg;
@@ -290,30 +504,30 @@ tdb_pg_shmem_worker_exit(int code, Datum arg)
 
     lock = tdb_pg_shmem_lock();
     LWLockAcquire(lock, LW_EXCLUSIVE);
-    if (tdb_pg_shmem_state->worker_pid == MyProcPid)
+    if (tdb_pg_shmem_state->worker_pid == MyProcPid &&
+        tdb_pg_shmem_state->worker_generation == tdb_pg_shmem_worker_generation)
     {
-        for (uint32 i = 0; i < tdb_pg_shmem_state->slot_count; i++)
-        {
-            TDBPgShmemSlot *slot = &tdb_pg_shmem_state->slots[i];
-            if (slot->state == TDB_PG_SLOT_READY ||
-                slot->state == TDB_PG_SLOT_PROCESSING)
-            {
-                tdb_pg_shmem_set_error_locked(slot, "background worker stopped");
-                if (slot->owner_latch)
-                    SetLatch(slot->owner_latch);
-            }
-        }
+        nwake = tdb_pg_shmem_fail_active_slots_locked(
+                    "background worker stopped before responding",
+                    tdb_pg_shmem_worker_generation,
+                    wake_latches, TDB_PG_SHMEM_SLOT_COUNT);
         tdb_pg_shmem_state->worker_ready = false;
         tdb_pg_shmem_state->worker_pid = 0;
+        tdb_pg_shmem_state->worker_proc_number = INVALID_PROC_NUMBER;
         tdb_pg_shmem_state->worker_latch = NULL;
     }
     LWLockRelease(lock);
+
+    tdb_pg_shmem_wake_latches(wake_latches, nwake);
 }
 
 static void
 tdb_pg_shmem_worker_ready(void)
 {
     LWLock *lock;
+    Latch  *wake_latches[TDB_PG_SHMEM_SLOT_COUNT];
+    int     nwake = 0;
+    uint32  worker_generation;
 
     if (!treedb_pg_shmem_enabled)
         return;
@@ -323,12 +537,31 @@ tdb_pg_shmem_worker_ready(void)
 
     lock = tdb_pg_shmem_lock();
     LWLockAcquire(lock, LW_EXCLUSIVE);
+    worker_generation = tdb_pg_shmem_next_worker_generation_locked();
+
+    if (tdb_pg_shmem_state->worker_pid != 0 ||
+        tdb_pg_shmem_state->worker_ready ||
+        tdb_pg_shmem_state->worker_generation != 0)
+        tdb_pg_shmem_state->worker_restarts++;
+
+    /* A restarted worker must not complete requests accepted by a previous
+     * worker epoch.  Fail active slots closed and wake their owners; callers
+     * can retry against this new worker deterministically. */
+    nwake = tdb_pg_shmem_fail_active_slots_locked(
+                "background worker restarted before responding",
+                0, wake_latches, TDB_PG_SHMEM_SLOT_COUNT);
+
+    tdb_pg_shmem_state->worker_generation = worker_generation;
     tdb_pg_shmem_state->worker_pid = MyProcPid;
+    tdb_pg_shmem_state->worker_proc_number = MyProcNumber;
     tdb_pg_shmem_state->worker_latch = MyLatch;
+    tdb_pg_shmem_state->worker_started_at = GetCurrentTimestamp();
     tdb_pg_shmem_state->worker_ready = true;
+    tdb_pg_shmem_worker_generation = worker_generation;
     LWLockRelease(lock);
 
-    on_shmem_exit(tdb_pg_shmem_worker_exit, (Datum) 0);
+    tdb_pg_shmem_wake_latches(wake_latches, nwake);
+    before_shmem_exit(tdb_pg_shmem_worker_exit, (Datum) 0);
 }
 
 static void
@@ -357,7 +590,7 @@ tdb_pg_shmem_ensure_slot(void)
 
     if (!tdb_pg_shmem_exit_registered)
     {
-        on_proc_exit(tdb_pg_shmem_backend_exit, (Datum) 0);
+        before_shmem_exit(tdb_pg_shmem_backend_exit, (Datum) 0);
         tdb_pg_shmem_exit_registered = true;
     }
 
@@ -371,15 +604,12 @@ tdb_pg_shmem_ensure_slot(void)
         if (tdb_pg_shmem_slot_index < (int) tdb_pg_shmem_state->slot_count)
         {
             TDBPgShmemSlot *slot = &tdb_pg_shmem_state->slots[tdb_pg_shmem_slot_index];
-            if (slot->owner_pid == MyProcPid &&
-                slot->generation == tdb_pg_shmem_slot_generation)
+            if (tdb_pg_shmem_slot_owned_by_me_locked(slot))
             {
                 if (slot->state == TDB_PG_SLOT_IDLE ||
                     slot->state == TDB_PG_SLOT_DONE)
                 {
-                    slot->state = TDB_PG_SLOT_IDLE;
-                    slot->req_len = 0;
-                    slot->resp_len = 0;
+                    tdb_pg_shmem_release_owned_slot_locked(slot);
                     ok = true;
                 }
             }
@@ -395,29 +625,22 @@ tdb_pg_shmem_ensure_slot(void)
 
     LWLockAcquire(lock, LW_EXCLUSIVE);
 
-    /* Reclaim slots from normally-exited backends.  Deep generation/restart
-     * semantics are intentionally left to #4. */
+    /* Reclaim abandoned slots, including PROCESSING slots.  Generation bumps
+     * make any later completion from an old worker epoch harmless. */
     for (uint32 i = 0; i < tdb_pg_shmem_state->slot_count; i++)
-    {
-        TDBPgShmemSlot *slot = &tdb_pg_shmem_state->slots[i];
-        if (slot->state != TDB_PG_SLOT_FREE &&
-            slot->state != TDB_PG_SLOT_PROCESSING &&
-            slot->owner_pid > 0 && !tdb_pid_alive(slot->owner_pid))
-            tdb_pg_shmem_reset_slot_locked(slot);
-    }
+        (void) tdb_pg_shmem_reclaim_dead_owner_locked(&tdb_pg_shmem_state->slots[i]);
 
     for (uint32 i = 0; i < tdb_pg_shmem_state->slot_count; i++)
     {
         TDBPgShmemSlot *slot = &tdb_pg_shmem_state->slots[i];
         if (slot->state == TDB_PG_SLOT_FREE)
         {
-            slot->state       = TDB_PG_SLOT_IDLE;
-            slot->owner_pid   = MyProcPid;
-            slot->owner_latch = MyLatch;
-            slot->generation  = tdb_pg_shmem_state->next_generation++;
-            slot->req_len     = 0;
-            slot->resp_len    = 0;
-            slot->status      = TDB_STATUS_ERROR;
+            slot->state             = TDB_PG_SLOT_IDLE;
+            slot->owner_pid         = MyProcPid;
+            slot->owner_proc_number = MyProcNumber;
+            slot->owner_latch       = MyLatch;
+            slot->generation        = tdb_pg_shmem_next_slot_generation_locked();
+            tdb_pg_shmem_clear_payload_locked(slot);
 
             tdb_pg_shmem_slot_index = (int) i;
             tdb_pg_shmem_slot_generation = slot->generation;
@@ -426,10 +649,25 @@ tdb_pg_shmem_ensure_slot(void)
         }
     }
 
-    LWLockRelease(lock);
-    ereport(ERROR,
-            (errmsg("treedb: no free pg_shmem RPC slots (max %u)",
-                    tdb_pg_shmem_state->slot_count)));
+    {
+        TDBPgShmemSlotStats stats;
+        uint32 slot_count = tdb_pg_shmem_state->slot_count;
+        int worker_pid = tdb_pg_shmem_state->worker_pid;
+        uint32 worker_generation = tdb_pg_shmem_state->worker_generation;
+        bool worker_ready = tdb_pg_shmem_state->worker_ready;
+
+        tdb_pg_shmem_collect_slot_stats_locked(&stats);
+        tdb_pg_shmem_state->slot_exhaustions++;
+        LWLockRelease(lock);
+        ereport(ERROR,
+                (errmsg("treedb: no free pg_shmem RPC slots (max %u)", slot_count),
+                 errdetail("slots free=%u idle=%u ready=%u processing=%u done=%u stale_owner=%u oldest_active_ms=%ld worker_ready=%s worker_pid=%d worker_generation=%u",
+                           stats.free_count, stats.idle_count, stats.ready_count,
+                           stats.processing_count, stats.done_count,
+                           stats.stale_owner_count, stats.oldest_active_ms,
+                           worker_ready ? "true" : "false",
+                           worker_pid, worker_generation)));
+    }
     return -1;
 }
 
@@ -440,23 +678,53 @@ tdb_pg_shmem_wait_worker_ready(void)
 
     for (int retry = 0; retry < TDB_PG_SHMEM_WORKER_RETRIES; retry++)
     {
-        bool ready;
-        int  pid;
+        bool   ready;
+        int    pid;
+        uint32 worker_generation;
 
         LWLockAcquire(lock, LW_SHARED);
         ready = tdb_pg_shmem_state != NULL &&
                 tdb_pg_shmem_state->worker_ready &&
                 tdb_pg_shmem_state->worker_latch != NULL;
         pid = tdb_pg_shmem_state != NULL ? tdb_pg_shmem_state->worker_pid : 0;
+        worker_generation = tdb_pg_shmem_state != NULL ?
+                            tdb_pg_shmem_state->worker_generation : 0;
         LWLockRelease(lock);
 
         if (ready && tdb_pid_alive(pid))
             return;
+
+        if (ready)
+        {
+            Latch *wake_latches[TDB_PG_SHMEM_SLOT_COUNT];
+            int    nwake = 0;
+
+            LWLockAcquire(lock, LW_EXCLUSIVE);
+            if (tdb_pg_shmem_state->worker_ready &&
+                tdb_pg_shmem_state->worker_pid == pid &&
+                tdb_pg_shmem_state->worker_generation == worker_generation &&
+                !tdb_pid_alive(pid))
+            {
+                nwake = tdb_pg_shmem_fail_active_slots_locked(
+                            "background worker exited before responding",
+                            worker_generation,
+                            wake_latches, TDB_PG_SHMEM_SLOT_COUNT);
+                tdb_pg_shmem_state->worker_ready = false;
+                tdb_pg_shmem_state->worker_pid = 0;
+                tdb_pg_shmem_state->worker_proc_number = INVALID_PROC_NUMBER;
+                tdb_pg_shmem_state->worker_latch = NULL;
+            }
+            LWLockRelease(lock);
+            tdb_pg_shmem_wake_latches(wake_latches, nwake);
+        }
+
         pg_usleep(100000L);
     }
 
     ereport(ERROR,
-            (errmsg("treedb: pg_shmem transport has no ready background worker")));
+            (errmsg("treedb: pg_shmem transport has no ready background worker"),
+             errdetail("waited %d ms for a live TreeDB background worker",
+                       TDB_PG_SHMEM_WORKER_RETRIES * 100)));
 }
 
 static int
@@ -467,6 +735,7 @@ tdb_pg_shmem_submit(uint8 opcode, const void *req, uint32 req_len)
     TDBPgShmemSlot *slot;
     Latch          *worker_latch;
     int             worker_pid;
+    uint32          worker_generation;
     bool            worker_ready;
 
     tdb_pg_shmem_check_ready();
@@ -481,38 +750,61 @@ tdb_pg_shmem_submit(uint8 opcode, const void *req, uint32 req_len)
 
     LWLockAcquire(lock, LW_EXCLUSIVE);
     slot = &tdb_pg_shmem_state->slots[slot_index];
-    if (slot->owner_pid != MyProcPid ||
-        slot->generation != tdb_pg_shmem_slot_generation ||
+    if (!tdb_pg_shmem_slot_owned_by_me_locked(slot) ||
         slot->state != TDB_PG_SLOT_IDLE)
     {
+        uint32 state = slot->state;
+        uint32 generation = slot->generation;
+        int owner_pid = slot->owner_pid;
+        ProcNumber owner_proc_number = slot->owner_proc_number;
         LWLockRelease(lock);
-        ereport(ERROR, (errmsg("treedb: pg_shmem backend slot is not reusable")));
+        ereport(ERROR,
+                (errmsg("treedb: pg_shmem backend slot is not reusable"),
+                 errdetail("slot=%d state=%s generation=%u owner_pid=%d owner_proc=%d local_generation=%u",
+                           slot_index, tdb_pg_shmem_state_name(state), generation,
+                           owner_pid, owner_proc_number,
+                           tdb_pg_shmem_slot_generation)));
     }
-
-    slot->opcode      = opcode;
-    slot->req_len     = req_len;
-    slot->status      = TDB_STATUS_ERROR;
-    slot->resp_len    = 0;
-    slot->owner_latch = MyLatch;
-    if (req_len > 0)
-        memcpy(slot->req, req, req_len);
 
     worker_ready = tdb_pg_shmem_state->worker_ready;
     worker_pid   = tdb_pg_shmem_state->worker_pid;
+    worker_generation = tdb_pg_shmem_state->worker_generation;
     worker_latch = tdb_pg_shmem_state->worker_latch;
+
+    slot->generation        = tdb_pg_shmem_next_slot_generation_locked();
+    tdb_pg_shmem_slot_generation = slot->generation;
+    slot->worker_generation = worker_generation;
+    slot->opcode            = opcode;
+    slot->req_len           = req_len;
+    slot->status            = TDB_STATUS_ERROR;
+    slot->resp_len          = 0;
+    slot->owner_pid         = MyProcPid;
+    slot->owner_proc_number = MyProcNumber;
+    slot->owner_latch       = MyLatch;
+    slot->submitted_at      = GetCurrentTimestamp();
+    slot->processing_at     = 0;
+    slot->completed_at      = 0;
+    if (req_len > 0)
+        memcpy(slot->req, req, req_len);
+
+    tdb_pg_shmem_state->requests_submitted++;
+    if (req_len > tdb_pg_shmem_state->max_request_bytes)
+        tdb_pg_shmem_state->max_request_bytes = req_len;
     slot->state  = TDB_PG_SLOT_READY;
     LWLockRelease(lock);
 
     if (!worker_ready || worker_latch == NULL || !tdb_pid_alive(worker_pid))
     {
         LWLockAcquire(lock, LW_EXCLUSIVE);
-        if (slot->owner_pid == MyProcPid &&
-            slot->generation == tdb_pg_shmem_slot_generation &&
+        if (tdb_pg_shmem_slot_owned_by_me_locked(slot) &&
             slot->state == TDB_PG_SLOT_READY)
-            slot->state = TDB_PG_SLOT_IDLE;
+            tdb_pg_shmem_release_owned_slot_locked(slot);
         LWLockRelease(lock);
         ereport(ERROR,
-                (errmsg("treedb: pg_shmem background worker is not available")));
+                (errmsg("treedb: pg_shmem background worker is not available"),
+                 errdetail("worker_ready=%s worker_pid=%d worker_generation=%u",
+                           worker_ready ? "true" : "false",
+                           worker_pid, worker_generation)));
     }
 
     SetLatch(worker_latch);
@@ -522,14 +814,22 @@ tdb_pg_shmem_submit(uint8 opcode, const void *req, uint32 req_len)
 static void
 tdb_pg_shmem_wait_done(int slot_index)
 {
-    LWLock *lock = tdb_pg_shmem_lock();
+    LWLock     *lock = tdb_pg_shmem_lock();
+    TimestampTz wait_started_at = GetCurrentTimestamp();
 
     ResetLatch(MyLatch);
     for (;;)
     {
-        int  worker_pid;
-        bool worker_ready;
-        bool done = false;
+        int         worker_pid;
+        uint32      worker_generation;
+        bool        worker_ready;
+        bool        done = false;
+        bool        slot_valid = false;
+        uint32      slot_state = TDB_PG_SLOT_FREE;
+        uint32      slot_worker_generation = 0;
+        TimestampTz submitted_at = wait_started_at;
+        long        elapsed_ms;
+        TimestampTz now;
 
         CHECK_FOR_INTERRUPTS();
 
@@ -537,31 +837,90 @@ tdb_pg_shmem_wait_done(int slot_index)
         if (slot_index >= 0 && slot_index < (int) tdb_pg_shmem_state->slot_count)
         {
             TDBPgShmemSlot *slot = &tdb_pg_shmem_state->slots[slot_index];
-            done = slot->owner_pid == MyProcPid &&
-                   slot->generation == tdb_pg_shmem_slot_generation &&
-                   slot->state == TDB_PG_SLOT_DONE;
+
+            slot_valid = tdb_pg_shmem_slot_owned_by_me_locked(slot);
+            if (slot_valid)
+            {
+                slot_state = slot->state;
+                slot_worker_generation = slot->worker_generation;
+                if (slot->submitted_at != 0)
+                    submitted_at = slot->submitted_at;
+                done = slot->state == TDB_PG_SLOT_DONE;
+            }
         }
         worker_ready = tdb_pg_shmem_state->worker_ready;
         worker_pid = tdb_pg_shmem_state->worker_pid;
+        worker_generation = tdb_pg_shmem_state->worker_generation;
         LWLockRelease(lock);
 
         if (done)
             return;
 
-        if (!worker_ready || !tdb_pid_alive(worker_pid))
+        if (!slot_valid)
+            ereport(ERROR,
+                    (errmsg("treedb: pg_shmem response slot changed before completion"),
+                     errdetail("slot=%d local_generation=%u", slot_index,
+                               tdb_pg_shmem_slot_generation)));
+
+        now = GetCurrentTimestamp();
+        elapsed_ms = TimestampDifferenceMilliseconds(submitted_at, now);
+
+        if (!worker_ready || !tdb_pid_alive(worker_pid) ||
+            worker_generation != slot_worker_generation)
         {
+            bool response_done = false;
+
             LWLockAcquire(lock, LW_EXCLUSIVE);
             if (slot_index >= 0 && slot_index < (int) tdb_pg_shmem_state->slot_count)
             {
                 TDBPgShmemSlot *slot = &tdb_pg_shmem_state->slots[slot_index];
-                if (slot->owner_pid == MyProcPid &&
-                    slot->generation == tdb_pg_shmem_slot_generation &&
-                    slot->state != TDB_PG_SLOT_DONE)
-                    slot->state = TDB_PG_SLOT_IDLE;
+                if (tdb_pg_shmem_slot_owned_by_me_locked(slot))
+                {
+                    if (slot->state == TDB_PG_SLOT_DONE)
+                        response_done = true;
+                    else
+                        tdb_pg_shmem_release_owned_slot_locked(slot);
+                }
             }
             LWLockRelease(lock);
+            if (response_done)
+                return;
             ereport(ERROR,
-                    (errmsg("treedb: pg_shmem background worker exited before responding")));
+                    (errmsg("treedb: pg_shmem background worker exited or restarted before responding"),
+                     errdetail("slot=%d state=%s elapsed_ms=%ld worker_ready=%s worker_pid=%d request_worker_generation=%u current_worker_generation=%u",
+                               slot_index, tdb_pg_shmem_state_name(slot_state), elapsed_ms,
+                               worker_ready ? "true" : "false", worker_pid,
+                               slot_worker_generation, worker_generation)));
+        }
+
+        if (elapsed_ms >= TDB_PG_SHMEM_RPC_TIMEOUT_MS)
+        {
+            bool response_done = false;
+
+            LWLockAcquire(lock, LW_EXCLUSIVE);
+            if (slot_index >= 0 && slot_index < (int) tdb_pg_shmem_state->slot_count)
+            {
+                TDBPgShmemSlot *slot = &tdb_pg_shmem_state->slots[slot_index];
+                if (tdb_pg_shmem_slot_owned_by_me_locked(slot))
+                {
+                    if (slot->state == TDB_PG_SLOT_DONE)
+                        response_done = true;
+                    else
+                    {
+                        tdb_pg_shmem_release_owned_slot_locked(slot);
+                        tdb_pg_shmem_state->request_timeouts++;
+                    }
+                }
+            }
+            LWLockRelease(lock);
+            if (response_done)
+                return;
+            ereport(ERROR,
+                    (errmsg("treedb: timed out waiting for pg_shmem background worker response"),
+                     errdetail("slot=%d state=%s elapsed_ms=%ld timeout_ms=%ld worker_pid=%d worker_generation=%u",
+                               slot_index, tdb_pg_shmem_state_name(slot_state), elapsed_ms,
+                               TDB_PG_SHMEM_RPC_TIMEOUT_MS, worker_pid,
+                               worker_generation)));
         }
 
         (void) WaitLatch(MyLatch,
@@ -584,12 +943,20 @@ tdb_pg_shmem_finish_palloc(int slot_index,
 
     LWLockAcquire(lock, LW_SHARED);
     slot = &tdb_pg_shmem_state->slots[slot_index];
-    if (slot->owner_pid != MyProcPid ||
-        slot->generation != tdb_pg_shmem_slot_generation ||
+    if (!tdb_pg_shmem_slot_owned_by_me_locked(slot) ||
         slot->state != TDB_PG_SLOT_DONE)
     {
+        uint32 state = slot->state;
+        uint32 generation = slot->generation;
+        int owner_pid = slot->owner_pid;
+        ProcNumber owner_proc_number = slot->owner_proc_number;
         LWLockRelease(lock);
-        ereport(ERROR, (errmsg("treedb: pg_shmem response slot is invalid")));
+        ereport(ERROR,
+                (errmsg("treedb: pg_shmem response slot is invalid"),
+                 errdetail("slot=%d state=%s generation=%u owner_pid=%d owner_proc=%d local_generation=%u",
+                           slot_index, tdb_pg_shmem_state_name(state), generation,
+                           owner_pid, owner_proc_number,
+                           tdb_pg_shmem_slot_generation)));
     }
     status = slot->status;
     rlen = slot->resp_len;
@@ -609,15 +976,20 @@ tdb_pg_shmem_finish_palloc(int slot_index,
 
     LWLockAcquire(lock, LW_EXCLUSIVE);
     slot = &tdb_pg_shmem_state->slots[slot_index];
-    if (slot->owner_pid == MyProcPid &&
-        slot->generation == tdb_pg_shmem_slot_generation &&
+    if (tdb_pg_shmem_slot_owned_by_me_locked(slot) &&
         slot->state == TDB_PG_SLOT_DONE)
     {
         if (status != TDB_STATUS_ERROR && rlen > 0 && buf != NULL)
             memcpy(buf, slot->resp, rlen);
-        slot->state = TDB_PG_SLOT_IDLE;
-        slot->req_len = 0;
-        slot->resp_len = 0;
+        tdb_pg_shmem_release_owned_slot_locked(slot);
+    }
+    else
+    {
+        if (buf != NULL)
+            pfree(buf);
+        LWLockRelease(lock);
+        ereport(ERROR,
+                (errmsg("treedb: pg_shmem response slot changed while copying response")));
     }
     LWLockRelease(lock);
 
@@ -651,12 +1023,20 @@ tdb_pg_shmem_finish_into(int slot_index,
 
     LWLockAcquire(lock, LW_EXCLUSIVE);
     slot = &tdb_pg_shmem_state->slots[slot_index];
-    if (slot->owner_pid != MyProcPid ||
-        slot->generation != tdb_pg_shmem_slot_generation ||
+    if (!tdb_pg_shmem_slot_owned_by_me_locked(slot) ||
         slot->state != TDB_PG_SLOT_DONE)
     {
+        uint32 state = slot->state;
+        uint32 generation = slot->generation;
+        int owner_pid = slot->owner_pid;
+        ProcNumber owner_proc_number = slot->owner_proc_number;
         LWLockRelease(lock);
-        ereport(ERROR, (errmsg("treedb: pg_shmem response slot is invalid")));
+        ereport(ERROR,
+                (errmsg("treedb: pg_shmem response slot is invalid"),
+                 errdetail("slot=%d state=%s generation=%u owner_pid=%d owner_proc=%d local_generation=%u",
+                           slot_index, tdb_pg_shmem_state_name(state), generation,
+                           owner_pid, owner_proc_number,
+                           tdb_pg_shmem_slot_generation)));
     }
 
     status = slot->status;
@@ -678,9 +1058,7 @@ tdb_pg_shmem_finish_into(int slot_index,
     {
         if (resp_buf == NULL || resp_buf_size < rlen)
         {
-            slot->state = TDB_PG_SLOT_IDLE;
-            slot->req_len = 0;
-            slot->resp_len = 0;
+            tdb_pg_shmem_release_owned_slot_locked(slot);
             LWLockRelease(lock);
             ereport(ERROR,
                     (errmsg("treedb: pg_shmem RPC response too large for caller buffer (%u > %u)",
@@ -689,9 +1067,7 @@ tdb_pg_shmem_finish_into(int slot_index,
         memcpy(resp_buf, slot->resp, rlen);
     }
 
-    slot->state = TDB_PG_SLOT_IDLE;
-    slot->req_len = 0;
-    slot->resp_len = 0;
+    tdb_pg_shmem_release_owned_slot_locked(slot);
     LWLockRelease(lock);
 
     if (status == TDB_STATUS_ERROR)
@@ -887,7 +1263,9 @@ tdb_pg_shmem_drain(treedb_handle_fn handle_fn,
         TDBPgShmemSlot *slot = NULL;
         int             slot_index = -1;
         uint32          generation = 0;
+        uint32          worker_generation = 0;
         int             owner_pid = 0;
+        ProcNumber      owner_proc_number = INVALID_PROC_NUMBER;
         uint8           opcode = 0;
         uint32          req_len = 0;
         uint8           status;
@@ -900,19 +1278,24 @@ tdb_pg_shmem_drain(treedb_handle_fn handle_fn,
         {
             slot = &tdb_pg_shmem_state->slots[i];
 
-            if (slot->state != TDB_PG_SLOT_FREE &&
-                slot->state != TDB_PG_SLOT_PROCESSING &&
-                slot->owner_pid > 0 && !tdb_pid_alive(slot->owner_pid))
-            {
-                tdb_pg_shmem_reset_slot_locked(slot);
+            if (tdb_pg_shmem_reclaim_dead_owner_locked(slot))
                 continue;
-            }
 
             if (slot->state == TDB_PG_SLOT_READY)
             {
+                if (slot->worker_generation != tdb_pg_shmem_worker_generation)
+                {
+                    tdb_pg_shmem_set_error_locked(slot,
+                        "background worker restarted before responding");
+                    owner_latch = slot->owner_latch;
+                    break;
+                }
+
                 slot_index = (int) i;
                 generation = slot->generation;
+                worker_generation = slot->worker_generation;
                 owner_pid = slot->owner_pid;
+                owner_proc_number = slot->owner_proc_number;
                 opcode = slot->opcode;
                 req_len = slot->req_len;
                 break;
@@ -922,6 +1305,14 @@ tdb_pg_shmem_drain(treedb_handle_fn handle_fn,
         if (slot_index < 0)
         {
             LWLockRelease(lock);
+            if (owner_latch)
+            {
+                SetLatch(owner_latch);
+                processed++;
+                if (processed >= max_requests)
+                    break;
+                continue;
+            }
             break;
         }
 
@@ -940,6 +1331,7 @@ tdb_pg_shmem_drain(treedb_handle_fn handle_fn,
 
         if (req_len > 0)
             memcpy(req_buf, slot->req, req_len);
+        slot->processing_at = GetCurrentTimestamp();
         slot->state = TDB_PG_SLOT_PROCESSING;
         LWLockRelease(lock);
 
@@ -955,16 +1347,27 @@ tdb_pg_shmem_drain(treedb_handle_fn handle_fn,
         LWLockAcquire(lock, LW_EXCLUSIVE);
         slot = &tdb_pg_shmem_state->slots[slot_index];
         if (slot->generation == generation &&
+            slot->worker_generation == worker_generation &&
             slot->owner_pid == owner_pid &&
+            slot->owner_proc_number == owner_proc_number &&
             slot->state == TDB_PG_SLOT_PROCESSING)
         {
             slot->status = status;
             slot->resp_len = resp_len;
             if (resp_len > 0)
                 memcpy(slot->resp, resp_buf, resp_len);
+            slot->completed_at = GetCurrentTimestamp();
             slot->state = TDB_PG_SLOT_DONE;
+            if (status == TDB_STATUS_ERROR)
+                tdb_pg_shmem_state->requests_failed++;
+            else
+                tdb_pg_shmem_state->requests_completed++;
+            if (resp_len > tdb_pg_shmem_state->max_response_bytes)
+                tdb_pg_shmem_state->max_response_bytes = resp_len;
             owner_latch = slot->owner_latch;
         }
+        else
+            tdb_pg_shmem_state->stale_completions++;
         LWLockRelease(lock);
 
         if (owner_latch)

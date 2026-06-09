@@ -84,7 +84,7 @@ To opt in to the PostgreSQL shared-memory/latch RPC path for a session after sta
 SET treedb.transport = 'pg_shmem';
 ```
 
-If shared memory was not enabled at postmaster start, selecting `pg_shmem` fails closed on the first TreeDB RPC. Row data is stored under `$PGDATA/treedb_data/<relfilenode>/`.
+If shared memory was not enabled at postmaster start, selecting `pg_shmem` fails closed on the first TreeDB RPC. The PG-shmem path also fails closed on stale slot generations, backend exit, worker restart/exit, slot exhaustion, and bounded response timeout; errors include slot/worker diagnostics to avoid silent hangs. Row data is stored under `$PGDATA/treedb_data/<relfilenode>/`.
 
 ## Benchmarks
 
