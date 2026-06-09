@@ -22,18 +22,19 @@ import (
 
 // Protocol opcodes (must match treedb_pgext.h)
 const (
-	opInsert      = 0x01
-	opScanBegin   = 0x02
-	opScanNext    = 0x03
-	opScanEnd     = 0x04
-	opFetch       = 0x05
-	opDelete      = 0x06
-	opTruncate    = 0x07
-	opCount       = 0x08
-	opUpdate      = 0x09
-	opInsertKeyed    = 0x0A
-	opRekey          = 0x0B
-	opScanNextBatch  = 0x0C
+	opInsert        = 0x01
+	opScanBegin     = 0x02
+	opScanNext      = 0x03
+	opScanEnd       = 0x04
+	opFetch         = 0x05
+	opDelete        = 0x06
+	opTruncate      = 0x07
+	opCount         = 0x08
+	opUpdate        = 0x09
+	opInsertKeyed   = 0x0A
+	opRekey         = 0x0B
+	opScanNextBatch = 0x0C
+	opCheckpointAll = 0x0D
 )
 
 const (
@@ -496,6 +497,29 @@ func handleTruncate(payload []byte) (byte, []byte) {
 	return statusOK, nil
 }
 
+func handleCheckpointAll(payload []byte) (byte, []byte) {
+	if len(payload) != 0 {
+		return statusError, []byte("checkpoint_all: unexpected payload")
+	}
+
+	dbMapMu.Lock()
+	dbs := make([]*treedb.DB, 0, len(dbMap))
+	for _, db := range dbMap {
+		dbs = append(dbs, db)
+	}
+	dbMapMu.Unlock()
+
+	for _, db := range dbs {
+		if err := db.Checkpoint(); err != nil {
+			return statusError, []byte(err.Error())
+		}
+	}
+
+	resp := make([]byte, 4)
+	binary.BigEndian.PutUint32(resp, uint32(len(dbs)))
+	return statusOK, resp
+}
+
 // dispatch routes an opcode + payload to the appropriate handler.
 func dispatch(opcode byte, payload []byte) (byte, []byte) {
 	switch opcode {
@@ -523,6 +547,8 @@ func dispatch(opcode byte, payload []byte) (byte, []byte) {
 		return handleRekey(payload)
 	case opScanNextBatch:
 		return handleScanNextBatch(payload)
+	case opCheckpointAll:
+		return handleCheckpointAll(payload)
 	default:
 		return statusError, []byte("unknown opcode")
 	}

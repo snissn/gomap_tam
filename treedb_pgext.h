@@ -27,6 +27,7 @@
 #define TDB_OP_INSERT_KEYED     0x0A  /* insert at caller-supplied key */
 #define TDB_OP_REKEY            0x0B  /* rename old_key → new_key (used during PK index build) */
 #define TDB_OP_SCAN_NEXT_BATCH  0x0C  /* fetch up to N rows in one RPC */
+#define TDB_OP_CHECKPOINT_ALL   0x0D  /* benchmark helper: checkpoint all open relation DBs */
 
 /*
  * Maximum bytes of row data returned per SCAN_NEXT_BATCH response.

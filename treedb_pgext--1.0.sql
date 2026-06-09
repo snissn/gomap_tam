@@ -8,3 +8,8 @@ CREATE FUNCTION treedb_am_handler(internal)
 CREATE ACCESS METHOD treedb
     TYPE TABLE
     HANDLER treedb_am_handler;
+
+CREATE FUNCTION treedb_checkpoint_all()
+    RETURNS integer
+    AS '$libdir/treedb_pgext'
+    LANGUAGE C;

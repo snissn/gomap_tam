@@ -80,44 +80,24 @@ Row data is stored under `$PGDATA/treedb_data/<relfilenode>/`.
 
 ## Benchmarks
 
-All numbers on Apple M-series, PostgreSQL 18, pgbench scale=1 (100K rows in `pgbench_accounts`), 1 client, 30 s.
+Use the repeatable transport baseline harness in
+[`benchmarks/`](benchmarks/README.md) for current numbers and artifact capture.
+The harness records exact commands, environment, result logs, and checkpointed
+TreeDB reader setup for heap vs the current TreeDB iceoryx singleton-owner path:
 
-### OLTP (TPC-B)
-
-```
-pgbench -d postgres -c 1 -T 30
-```
-
-| AM | TPS | Avg latency |
-|---|---|---|
-| heap (baseline) | 6,291 | 0.159 ms |
-| treedb | ~6,350 | ~0.157 ms |
-
-treedb matches heap throughput. Each TPC-B transaction issues 7 RPCs over iceoryx2 shared memory (~19 µs/RPC). The B+tree does one lookup where heap would do an index lookup + heap fetch.
-
-### Sequential scan (OLAP)
-
-```sql
-SELECT SUM(abalance) FROM pgbench_accounts;
+```bash
+TDB_BENCH_OUT="artifacts/tam_transport/$(date -u +%Y%m%dT%H%M%SZ)" \
+TDB_BENCH_SCALE=1 \
+TDB_BENCH_TIME=30 \
+TDB_BENCH_CLIENTS="1 2 4 8 16" \
+benchmarks/treedb_transport_baseline.sh
 ```
 
-| AM | Latency (warm) | Notes |
-|---|---|---|
-| heap | ~2 ms | linear shared_buffers scan |
-| treedb | ~20 ms | 64 KB batches, ~150 RPCs |
-
-treedb is ~10× slower for full-table scans. The bottleneck is the Go B+tree iterator — 100K `Next()` calls through tree leaf nodes costs ~10 ms regardless of batch size. Heap reads raw 8 KB pages sequentially with no tree overhead.
-
-### IPC evolution (OLTP TPS, for reference)
-
-| Transport | TPS | Change |
-|---|---|---|
-| Unix socket (original) | ~2,000 | — |
-| iceoryx2 + sched_yield | ~5,963 | 3× |
-| + notifier/WaitSet | ~6,753 | +13% |
-| + client spin-then-yield | ~7,630 | +13% |
-
-The peak of ~7,630 TPS (121% of heap) was measured before `SCAN_NEXT_BATCH` was added; the 256 KB bgworker response buffer used for batch scans slightly affects OLTP allocation sizing, settling at ~6,350 TPS in the current build.
+Current coordinator context on Apple M3 / PostgreSQL 18.4 / pgbench scale=1
+showed heap ahead of the current iceoryx path for c=1 TPC-B, select-only, and
+SUM scan benchmarks. Treat direct-CGO numbers as c=1 diagnostic context only;
+direct-CGO-per-backend is not a production c>1 architecture because it violates
+singleton TreeDB ownership and collides on TreeDB locks.
 
 ## Tuning
 
