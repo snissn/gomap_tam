@@ -24,8 +24,10 @@
 #include "treedb_pgext.h"
 
 PG_FUNCTION_INFO_V1(treedb_am_handler);
+PG_FUNCTION_INFO_V1(treedb_checkpoint_all);
 /* forward decl for handler log */
 Datum treedb_am_handler(PG_FUNCTION_ARGS);
+Datum treedb_checkpoint_all(PG_FUNCTION_ARGS);
 
 /* ----------------------------------------------------------------
  * Scan descriptor (embedded TableScanDescData must be first).
@@ -172,6 +174,27 @@ tdb_scan_next_batch(TDBScanDesc *scan, Oid tableOid, TupleTableSlot *slot)
 
     ExecStoreHeapTuple(&scan->current_tuple, slot, false);
     return true;
+}
+
+static int32
+tdb_checkpoint_all_rpc(void)
+{
+    void   *resp = NULL;
+    uint32  resp_len;
+    int32   checkpointed = 0;
+
+    tdb_rpc(TDB_OP_CHECKPOINT_ALL, NULL, 0, &resp, &resp_len);
+
+    if (resp && resp_len >= 4)
+        checkpointed = (int32) tdb_get_u32((uint8 *) resp);
+    if (resp) pfree(resp);
+    return checkpointed;
+}
+
+Datum
+treedb_checkpoint_all(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_INT32(tdb_checkpoint_all_rpc());
 }
 
 static void
