@@ -4,9 +4,11 @@
 #include <stdint.h>
 #include <string.h>
 #include <sched.h>   /* sched_yield() */
+#include <time.h>
 
 #include "postgres.h"
-#include "miscadmin.h"   /* DataDir */
+#include "miscadmin.h"   /* DataDir, MyLatch */
+#include "storage/latch.h"
 #include "storage/pg_shmem.h"
 
 /* iceoryx2 C bindings */
@@ -46,6 +48,12 @@
 /* Maximum tuple size in a single RPC. */
 #define TDB_MAX_TUPLE_BYTES  (8 * 1024)
 
+/* Maximum request/response slices including protocol bytes. */
+#define TDB_MAX_REQ_SLICE     (TDB_MAX_TUPLE_BYTES + 32)
+#define TDB_MAX_REQ_PAYLOAD   (TDB_MAX_REQ_SLICE - 1)
+#define TDB_MAX_RESP_PAYLOAD  TDB_SCAN_RESP_BUF
+#define TDB_MAX_RESP_SLICE    (TDB_MAX_RESP_PAYLOAD + 1)
+
 /*
  * CPU pause hint for spin-wait loops.
  * ARM yield / x86 PAUSE: ~5 ns each, avoids pipeline stalls and excess power.
@@ -61,6 +69,7 @@
 /* 2048 measured at ~7,630 TPS; doubling to 4096 dropped to ~7,411 TPS —
  * 2048 is near the sweet spot where almost all responses arrive in phase 1. */
 #define TDB_SPIN_ITERS  2048
+#define TDB_RPC_RESPONSE_TIMEOUT_SEC  10
 
 /* iceoryx2 service names — must match treedb_bgworker.c */
 #define TDB_SERVICE_NAME       "treedb/bgworker"
@@ -68,6 +77,33 @@
 
 /* Initial max slice length hint for the client (u8 elements). */
 #define TDB_CLIENT_MAX_SLICE  (8 * 1024 + 64)
+
+/* Runtime transport selection.  iceoryx remains the default; pg_shmem is opt-in. */
+typedef enum TDBTransportMode
+{
+    TDB_TRANSPORT_ICEORYX = 0,
+    TDB_TRANSPORT_PG_SHMEM = 1
+} TDBTransportMode;
+
+extern int  treedb_transport_mode;
+extern bool treedb_pg_shmem_enabled;
+
+extern uint8 tdb_pg_shmem_rpc(uint8 opcode,
+                              const void *req, uint32 req_len,
+                              void **resp_out, uint32 *resp_len_out);
+extern uint8 tdb_pg_shmem_rpc_into(uint8 opcode,
+                                   const void *req, uint32 req_len,
+                                   void *resp_buf, uint32 resp_buf_size,
+                                   uint32 *resp_len_out);
+
+static inline void
+tdb_validate_request_size(uint32 req_len)
+{
+    if ((uint64) req_len + 1 > TDB_MAX_REQ_SLICE)
+        ereport(ERROR,
+                (errmsg("treedb: RPC request too large (%u payload bytes; max %u)",
+                        req_len, (uint32) TDB_MAX_REQ_PAYLOAD)));
+}
 
 /* ----------------------------------------------------------------
  * Path helpers
@@ -153,7 +189,7 @@ tdb_iox2_connect(void)
      * available the event service is guaranteed to exist too. */
     while (retries-- > 0)
     {
-        ret = iox2_service_builder_request_response_open_or_create(sb_rr, NULL, &service);
+        ret = iox2_service_builder_request_response_open(sb_rr, NULL, &service);
         if (ret == IOX2_OK)
             break;
         pg_usleep(100000L); /* 100 ms */
@@ -185,7 +221,7 @@ tdb_iox2_connect(void)
     evt_svc_bldr = iox2_node_service_builder(&tdb_iox2_node, NULL,
                                              iox2_cast_service_name_ptr(evt_svc_name));
     evt_sb = iox2_service_builder_event(evt_svc_bldr);
-    ret = iox2_service_builder_event_open_or_create(evt_sb, NULL, &evt_factory);
+    ret = iox2_service_builder_event_open(evt_sb, NULL, &evt_factory);
     if (ret != IOX2_OK)
         ereport(ERROR, (errmsg("treedb: event service open failed: %d", ret)));
 
@@ -217,9 +253,9 @@ tdb_get_client(void)
  * Returns TDB_STATUS_OK or TDB_STATUS_NOT_FOUND.
  * ---------------------------------------------------------------- */
 static inline uint8
-tdb_rpc(uint8 opcode,
-        const void *req, uint32 req_len,
-        void **resp_out, uint32 *resp_len_out)
+tdb_iox2_rpc(uint8 opcode,
+             const void *req, uint32 req_len,
+             void **resp_out, uint32 *resp_len_out)
 {
     iox2_client_h          *client      = tdb_get_client();
     iox2_request_mut_h      request     = NULL;
@@ -233,6 +269,7 @@ tdb_rpc(uint8 opcode,
     uint32                  rlen;
     int                     ret;
     int                     spin;
+    time_t                  deadline;
 
     /* Loan shared-memory slice for the request. */
     ret = iox2_client_loan_slice_uninit(client, NULL, &request, total_req);
@@ -274,8 +311,15 @@ tdb_rpc(uint8 opcode,
             break;
         TDB_CPU_PAUSE();
     }
+    deadline = time(NULL) + TDB_RPC_RESPONSE_TIMEOUT_SEC;
     while (response == NULL)
     {
+        if (time(NULL) >= deadline)
+        {
+            iox2_pending_response_drop(pending);
+            ereport(ERROR,
+                    (errmsg("treedb: timed out waiting for background worker response")));
+        }
         ret = iox2_pending_response_receive(&pending, NULL, &response);
         if (ret != IOX2_OK)
         {
@@ -327,6 +371,19 @@ tdb_rpc(uint8 opcode,
     return status;
 }
 
+static inline uint8
+tdb_rpc(uint8 opcode,
+        const void *req, uint32 req_len,
+        void **resp_out, uint32 *resp_len_out)
+{
+    tdb_validate_request_size(req_len);
+
+    if (treedb_transport_mode == TDB_TRANSPORT_PG_SHMEM)
+        return tdb_pg_shmem_rpc(opcode, req, req_len, resp_out, resp_len_out);
+
+    return tdb_iox2_rpc(opcode, req, req_len, resp_out, resp_len_out);
+}
+
 /*
  * tdb_rpc_into — like tdb_rpc but writes response bytes directly into
  * a caller-provided buffer instead of palloc'ing.  Used by the batch
@@ -336,9 +393,9 @@ tdb_rpc(uint8 opcode,
  * written.  Raises ereport(ERROR) on transport error or TDB_STATUS_ERROR.
  */
 static inline uint8
-tdb_rpc_into(uint8 opcode,
-             const void *req, uint32 req_len,
-             void *resp_buf, uint32 resp_buf_size, uint32 *resp_len_out)
+tdb_iox2_rpc_into(uint8 opcode,
+                  const void *req, uint32 req_len,
+                  void *resp_buf, uint32 resp_buf_size, uint32 *resp_len_out)
 {
     iox2_client_h          *client      = tdb_get_client();
     iox2_request_mut_h      request     = NULL;
@@ -352,6 +409,7 @@ tdb_rpc_into(uint8 opcode,
     uint32                  rlen;
     int                     ret;
     int                     spin;
+    time_t                  deadline;
 
     ret = iox2_client_loan_slice_uninit(client, NULL, &request, total_req);
     if (ret != IOX2_OK)
@@ -380,8 +438,15 @@ tdb_rpc_into(uint8 opcode,
         if (response != NULL) break;
         TDB_CPU_PAUSE();
     }
+    deadline = time(NULL) + TDB_RPC_RESPONSE_TIMEOUT_SEC;
     while (response == NULL)
     {
+        if (time(NULL) >= deadline)
+        {
+            iox2_pending_response_drop(pending);
+            ereport(ERROR,
+                    (errmsg("treedb: timed out waiting for background worker response")));
+        }
         ret = iox2_pending_response_receive(&pending, NULL, &response);
         if (ret != IOX2_OK)
         {
@@ -414,14 +479,36 @@ tdb_rpc_into(uint8 opcode,
     }
 
     if (resp_len_out) *resp_len_out = 0;
-    if (rlen > 0 && resp_buf != NULL && resp_buf_size >= rlen)
+    if (rlen > 0)
     {
+        if (resp_buf == NULL || resp_buf_size < rlen)
+        {
+            iox2_response_drop(response);
+            ereport(ERROR,
+                    (errmsg("treedb: RPC response too large for caller buffer (%u > %u)",
+                            rlen, resp_buf_size)));
+        }
         memcpy(resp_buf, resp_data + 1, rlen);
         if (resp_len_out) *resp_len_out = rlen;
     }
 
     iox2_response_drop(response);
     return status;
+}
+
+static inline uint8
+tdb_rpc_into(uint8 opcode,
+             const void *req, uint32 req_len,
+             void *resp_buf, uint32 resp_buf_size, uint32 *resp_len_out)
+{
+    tdb_validate_request_size(req_len);
+
+    if (treedb_transport_mode == TDB_TRANSPORT_PG_SHMEM)
+        return tdb_pg_shmem_rpc_into(opcode, req, req_len,
+                                     resp_buf, resp_buf_size, resp_len_out);
+
+    return tdb_iox2_rpc_into(opcode, req, req_len,
+                             resp_buf, resp_buf_size, resp_len_out);
 }
 
 /* ----------------------------------------------------------------

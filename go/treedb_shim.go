@@ -602,6 +602,10 @@ func treedb_handle(
 	if respLenOut != nil {
 		*respLenOut = 0
 	}
+	if len(respPayload) > int(respBufSize) {
+		status = statusError
+		respPayload = []byte(fmt.Sprintf("response too large: %d > %d", len(respPayload), uint32(respBufSize)))
+	}
 	if len(respPayload) > 0 && respBuf != nil && respBufSize > 0 {
 		dst := (*[1 << 30]byte)(unsafe.Pointer(respBuf))[:int(respBufSize):int(respBufSize)]
 		n := copy(dst, respPayload)

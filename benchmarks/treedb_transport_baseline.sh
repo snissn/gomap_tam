@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Repeatable pgbench harness for TreeDB TAM transport baseline evidence.
-# It compares PostgreSQL heap with the current TreeDB iceoryx singleton-owner path.
+# It compares PostgreSQL heap with TreeDB singleton-owner transports.
 
 set -euo pipefail
 
@@ -8,9 +8,10 @@ usage() {
   cat <<'USAGE'
 Usage: benchmarks/treedb_transport_baseline.sh [--help]
 
-Creates fresh pgbench databases and records heap vs TreeDB iceoryx transport
-baseline artifacts. PostgreSQL must already be running; for TreeDB runs the
-extension must be installed and listed in shared_preload_libraries.
+Creates fresh pgbench databases and records heap vs TreeDB transport artifacts.
+PostgreSQL must already be running; for TreeDB runs the extension must be
+installed and listed in shared_preload_libraries. The pg_shmem transport also
+requires treedb.pg_shmem_enabled=on at postmaster start.
 
 Environment:
   PGDATABASE              maintenance database for createdb/dropdb (default: postgres)
@@ -20,6 +21,7 @@ Environment:
   TDB_BENCH_TIME         seconds per pgbench run (default: 30)
   TDB_BENCH_CLIENTS      read matrix clients/jobs (default: "1 2 4 8 16")
   TDB_BENCH_TRANSPORTS   transports to run (default: "heap treedb_iceoryx")
+                          supported: heap treedb_iceoryx treedb_pg_shmem
   TDB_BENCH_PREFIX       database name prefix (default: tam_<utc-ts>)
   TDB_BENCH_KEEP_DBS     keep generated DBs after success (default: 0)
 
@@ -29,6 +31,9 @@ Artifacts:
   results.tsv            parsed TPS summary
   sum.sql                SUM scan pgbench script
   *.log                  stdout/stderr for each setup and benchmark command
+
+For #3 transport comparisons, run TDB_BENCH_TRANSPORTS="heap treedb_iceoryx treedb_pg_shmem"
+against a server started with treedb.pg_shmem_enabled=on.
 
 Direct-CGO probe note: this harness intentionally does not run direct-CGO as a
 production transport. If a local prototype branch has such a probe, run only c=1
@@ -88,6 +93,16 @@ run_logged() {
   } >"$log" 2>&1
 }
 
+run_logged_pg() {
+  local name=$1
+  shift
+  if [[ -n "${TDB_BENCH_RUN_PGOPTIONS:-}" ]]; then
+    run_logged "$name" env "PGOPTIONS=$TDB_BENCH_RUN_PGOPTIONS" "$@"
+  else
+    run_logged "$name" "$@"
+  fi
+}
+
 extract_tps() {
   local log=$1
   awk '/^tps = / { print $3; found=1 } END { if (!found) print "" }' "$log" | tail -1
@@ -103,7 +118,7 @@ run_pgbench() {
   local name="${transport}_${benchmark}_c${clients}"
   local log="$TDB_BENCH_OUT/${name}.log"
 
-  run_logged "$name" pgbench -d "$db" -c "$clients" -j "$jobs" -T "$TDB_BENCH_TIME" "$@"
+  run_logged_pg "$name" pgbench -d "$db" -c "$clients" -j "$jobs" -T "$TDB_BENCH_TIME" "$@"
   local tps
   tps=$(extract_tps "$log")
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -159,6 +174,8 @@ write_environment() {
     echo "TDB_BENCH_KEEP_DBS=$TDB_BENCH_KEEP_DBS"
     echo "server_version=$(psql -X -At -d "$PGDATABASE" -c 'SHOW server_version;' 2>/dev/null || true)"
     echo "shared_preload_libraries=$(psql -X -At -d "$PGDATABASE" -c 'SHOW shared_preload_libraries;' 2>/dev/null || true)"
+    echo "treedb.pg_shmem_enabled=$(psql -X -At -d "$PGDATABASE" -c 'SHOW treedb.pg_shmem_enabled;' 2>/dev/null || true)"
+    echo "treedb.transport=$(psql -X -At -d "$PGDATABASE" -c 'SHOW treedb.transport;' 2>/dev/null || true)"
     if command -v go >/dev/null 2>&1 && [[ -d go ]]; then
       (
         cd go
@@ -175,13 +192,27 @@ write_environment() {
 }
 
 require_treedb_preload() {
+  local transport=${1:-treedb}
   local preload
   preload=$(psql -X -At -d "$PGDATABASE" -c 'SHOW shared_preload_libraries;')
   if [[ ",${preload// /}," != *",treedb_pgext,"* ]]; then
     cat >&2 <<EOF
-error: TDB_BENCH_TRANSPORTS includes treedb_iceoryx, but shared_preload_libraries is "$preload".
+error: TDB_BENCH_TRANSPORTS includes $transport, but shared_preload_libraries is "$preload".
 Install the extension, set shared_preload_libraries = 'treedb_pgext', restart PostgreSQL,
 and rerun this harness. See benchmarks/README.md.
+EOF
+    exit 2
+  fi
+}
+
+require_pg_shmem_enabled() {
+  local enabled
+  enabled=$(psql -X -At -d "$PGDATABASE" -c 'SHOW treedb.pg_shmem_enabled;')
+  if [[ "$enabled" != "on" ]]; then
+    cat >&2 <<EOF
+error: TDB_BENCH_TRANSPORTS includes treedb_pg_shmem, but treedb.pg_shmem_enabled is "$enabled".
+Set treedb.pg_shmem_enabled = on, keep shared_preload_libraries = 'treedb_pgext',
+restart PostgreSQL, and rerun this harness.
 EOF
     exit 2
   fi
@@ -190,7 +221,7 @@ EOF
 checkpoint_treedb() {
   local db=$1
   local label=$2
-  run_logged "treedb_checkpoint_${label}" \
+  run_logged_pg "treedb_checkpoint_${label}" \
     psql -X -v ON_ERROR_STOP=1 -d "$db" -c 'SELECT treedb_checkpoint_all();'
 }
 
@@ -208,25 +239,50 @@ run_heap() {
   done
 }
 
-run_treedb_iceoryx() {
-  local db="${TDB_BENCH_PREFIX}_treedb"
-  createdb_fresh "$db"
-  run_logged treedb_create_extension psql -X -v ON_ERROR_STOP=1 -d "$db" -c 'CREATE EXTENSION treedb_pgext;'
-  run_logged treedb_init env PGOPTIONS='-c default_table_access_method=treedb' \
-    pgbench -i -s "$TDB_BENCH_SCALE" "$db"
-  run_logged treedb_verify_table_am psql -X -v ON_ERROR_STOP=1 -d "$db" -c \
-    "SELECT c.relname, am.amname FROM pg_class c JOIN pg_am am ON am.oid = c.relam WHERE c.relname LIKE 'pgbench_%' AND c.relkind = 'r' ORDER BY 1;"
-  checkpoint_treedb "$db" after_init
+run_treedb_transport() {
+  local transport=$1
+  local db_suffix=$2
+  local init_pgoptions=$3
+  local run_pgoptions=$4
+  local db="${TDB_BENCH_PREFIX}_${db_suffix}"
+  local old_pgoptions="${TDB_BENCH_RUN_PGOPTIONS:-}"
 
-  run_pgbench treedb_iceoryx tpcb 1 "$db"
-  checkpoint_treedb "$db" before_select_only
+  createdb_fresh "$db"
+  run_logged "${transport}_create_extension" psql -X -v ON_ERROR_STOP=1 -d "$db" -c 'CREATE EXTENSION treedb_pgext;'
+  run_logged "${transport}_init" env PGOPTIONS="$init_pgoptions" \
+    pgbench -i -s "$TDB_BENCH_SCALE" "$db"
+  run_logged "${transport}_verify_table_am" psql -X -v ON_ERROR_STOP=1 -d "$db" -c \
+    "SELECT c.relname, am.amname FROM pg_class c JOIN pg_am am ON am.oid = c.relam WHERE c.relname LIKE 'pgbench_%' AND c.relkind = 'r' ORDER BY 1;"
+
+  export TDB_BENCH_RUN_PGOPTIONS="$run_pgoptions"
+  checkpoint_treedb "$db" "${transport}_after_init"
+
+  run_pgbench "$transport" tpcb 1 "$db"
+  checkpoint_treedb "$db" "${transport}_before_select_only"
   for c in $TDB_BENCH_CLIENTS; do
-    run_pgbench treedb_iceoryx select_only "$c" "$db" -S
+    run_pgbench "$transport" select_only "$c" "$db" -S
   done
-  checkpoint_treedb "$db" before_sum_scan
+  checkpoint_treedb "$db" "${transport}_before_sum_scan"
   for c in $TDB_BENCH_CLIENTS; do
-    run_pgbench treedb_iceoryx sum_scan "$c" "$db" -f "$sum_sql"
+    run_pgbench "$transport" sum_scan "$c" "$db" -f "$sum_sql"
   done
+
+  if [[ -n "$old_pgoptions" ]]; then
+    export TDB_BENCH_RUN_PGOPTIONS="$old_pgoptions"
+  else
+    unset TDB_BENCH_RUN_PGOPTIONS
+  fi
+}
+
+run_treedb_iceoryx() {
+  run_treedb_transport treedb_iceoryx treedb_iceoryx \
+    '-c default_table_access_method=treedb' ''
+}
+
+run_treedb_pg_shmem() {
+  run_treedb_transport treedb_pg_shmem treedb_pg_shmem \
+    '-c treedb.transport=pg_shmem -c default_table_access_method=treedb' \
+    '-c treedb.transport=pg_shmem'
 }
 
 write_environment
@@ -237,8 +293,13 @@ for transport in $TDB_BENCH_TRANSPORTS; do
       run_heap
       ;;
     treedb_iceoryx)
-      require_treedb_preload
+      require_treedb_preload treedb_iceoryx
       run_treedb_iceoryx
+      ;;
+    treedb_pg_shmem)
+      require_treedb_preload treedb_pg_shmem
+      require_pg_shmem_enabled
+      run_treedb_pg_shmem
       ;;
     direct_cgo_probe)
       cat >&2 <<'EOF'
