@@ -69,6 +69,7 @@ static const struct config_enum_entry treedb_transport_options[] = {
 #define TDB_PG_SHMEM_MAGIC           0x54444253U /* TDBS */
 #define TDB_PG_SHMEM_VERSION         1U
 #define TDB_PG_SHMEM_SLOT_COUNT      64U
+#define TDB_PG_SHMEM_DRAIN_BATCH     32U       /* Fairness: check iceoryx between batches. */
 #define TDB_PG_SHMEM_WORKER_RETRIES  100       /* 100 x 100 ms = 10 s */
 #define TDB_PG_SHMEM_WAIT_MS         1000L
 
@@ -841,16 +842,33 @@ tdb_iox2_event_noop_cb(const iox2_event_id_t *event_id,
     (void) ctx;
 }
 
-static bool
+static void
+tdb_iox2_drain_nonblocking(iox2_listener_h *listener,
+                           tdb_bgworker_ctx_t *wctx)
+{
+    uint64_t n_notifs = 0;
+    int      ret;
+
+    ret = iox2_listener_try_wait(listener, &n_notifs,
+                                 tdb_iox2_event_noop_cb, NULL);
+    if (ret != IOX2_OK)
+        ereport(WARNING,
+                (errmsg("treedb: listener wait error %d; continuing", ret)));
+
+    (void) tdb_process_requests_cb(NULL, wctx);
+}
+
+static uint32
 tdb_pg_shmem_drain(treedb_handle_fn handle_fn,
-                   uint8_t *resp_buf, uint32_t resp_buf_size)
+                   uint8_t *resp_buf, uint32_t resp_buf_size,
+                   uint32 max_requests)
 {
     LWLock *lock;
-    bool    processed_any = false;
+    uint32  processed = 0;
     uint8_t req_buf[TDB_MAX_REQ_PAYLOAD];
 
-    if (!treedb_pg_shmem_enabled || tdb_pg_shmem_state == NULL)
-        return false;
+    if (!treedb_pg_shmem_enabled || tdb_pg_shmem_state == NULL || max_requests == 0)
+        return 0;
 
     lock = tdb_pg_shmem_lock();
 
@@ -904,7 +922,9 @@ tdb_pg_shmem_drain(treedb_handle_fn handle_fn,
             LWLockRelease(lock);
             if (owner_latch)
                 SetLatch(owner_latch);
-            processed_any = true;
+            processed++;
+            if (processed >= max_requests)
+                break;
             continue;
         }
 
@@ -939,10 +959,12 @@ tdb_pg_shmem_drain(treedb_handle_fn handle_fn,
 
         if (owner_latch)
             SetLatch(owner_latch);
-        processed_any = true;
+        processed++;
+        if (processed >= max_requests)
+            break;
     }
 
-    return processed_any;
+    return processed;
 }
 
 /* ----------------------------------------------------------------
@@ -1306,10 +1328,22 @@ treedb_bgworker_main(Datum main_arg)
 
         while (!tdb_got_sigterm)
         {
-            int rc;
+            int    rc;
+            uint32 shmem_processed;
 
-            if (tdb_pg_shmem_drain(handle_fn, resp_buf, sizeof(resp_buf)))
-                continue;
+            /* Fairness: pg_shmem is opt-in but iceoryx remains the default.
+             * Drain only a bounded shared-memory batch before giving iceoryx a
+             * nonblocking service chance, so steady pg_shmem traffic cannot
+             * starve default/fallback iceoryx sessions until client timeout. */
+            shmem_processed = tdb_pg_shmem_drain(handle_fn, resp_buf,
+                                                 sizeof(resp_buf),
+                                                 TDB_PG_SHMEM_DRAIN_BATCH);
+            if (shmem_processed > 0)
+            {
+                tdb_iox2_drain_nonblocking(&listener, &wctx);
+                if (shmem_processed >= TDB_PG_SHMEM_DRAIN_BATCH)
+                    continue;
+            }
 
             rc = WaitLatchOrSocket(MyLatch,
                                    WL_LATCH_SET | WL_SOCKET_READABLE |
@@ -1319,19 +1353,15 @@ treedb_bgworker_main(Datum main_arg)
             if (rc & WL_LATCH_SET)
             {
                 ResetLatch(MyLatch);
-                (void) tdb_pg_shmem_drain(handle_fn, resp_buf, sizeof(resp_buf));
+                shmem_processed = tdb_pg_shmem_drain(handle_fn, resp_buf,
+                                                     sizeof(resp_buf),
+                                                     TDB_PG_SHMEM_DRAIN_BATCH);
+                if (shmem_processed > 0)
+                    tdb_iox2_drain_nonblocking(&listener, &wctx);
             }
 
             if (rc & WL_SOCKET_READABLE)
-            {
-                uint64_t n_notifs = 0;
-                ret = iox2_listener_try_wait(&listener, &n_notifs,
-                                             tdb_iox2_event_noop_cb, NULL);
-                if (ret != IOX2_OK)
-                    ereport(WARNING,
-                            (errmsg("treedb: listener wait error %d; continuing", ret)));
-                (void) tdb_process_requests_cb(NULL, &wctx);
-            }
+                tdb_iox2_drain_nonblocking(&listener, &wctx);
         }
     }
     else
