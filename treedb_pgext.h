@@ -175,20 +175,30 @@ tdb_iox2_connect(void)
     if (ret != IOX2_OK)
         ereport(ERROR, (errmsg("treedb: iox2_service_name_new failed: %d", ret)));
 
-    svc_builder = iox2_node_service_builder(&tdb_iox2_node, NULL,
-                                            iox2_cast_service_name_ptr(svc_name));
-    sb_rr = iox2_service_builder_request_response(svc_builder);
-
-    iox2_service_builder_request_response_set_request_payload_type_details(
-            &sb_rr, iox2_type_variant_e_DYNAMIC, "u8", 2, 1, 1);
-    iox2_service_builder_request_response_set_response_payload_type_details(
-            &sb_rr, iox2_type_variant_e_DYNAMIC, "u8", 2, 1, 1);
-
     /* Retry until the background worker has created the rr service.
      * The event service is created first by the bgworker, so once rr is
-     * available the event service is guaranteed to exist too. */
+     * available the event service is guaranteed to exist too.
+     *
+     * iceoryx2 consumes/invalidates the request-response builder on open
+     * attempts, including failures, so recreate it for each retry. */
     while (retries-- > 0)
     {
+        svc_builder = iox2_node_service_builder(&tdb_iox2_node, NULL,
+                                                iox2_cast_service_name_ptr(svc_name));
+        sb_rr = iox2_service_builder_request_response(svc_builder);
+
+        ret = iox2_service_builder_request_response_set_request_payload_type_details(
+                &sb_rr, iox2_type_variant_e_DYNAMIC, "u8", 2, 1, 1);
+        if (ret != IOX2_OK)
+            ereport(ERROR,
+                    (errmsg("treedb: set request type details failed: %d", ret)));
+
+        ret = iox2_service_builder_request_response_set_response_payload_type_details(
+                &sb_rr, iox2_type_variant_e_DYNAMIC, "u8", 2, 1, 1);
+        if (ret != IOX2_OK)
+            ereport(ERROR,
+                    (errmsg("treedb: set response type details failed: %d", ret)));
+
         ret = iox2_service_builder_request_response_open(sb_rr, NULL, &service);
         if (ret == IOX2_OK)
             break;
@@ -269,7 +279,7 @@ tdb_iox2_rpc(uint8 opcode,
     uint32                  rlen;
     int                     ret;
     int                     spin;
-    time_t                  deadline;
+    time_t                  deadline = 0;
 
     /* Loan shared-memory slice for the request. */
     ret = iox2_client_loan_slice_uninit(client, NULL, &request, total_req);
@@ -409,7 +419,7 @@ tdb_iox2_rpc_into(uint8 opcode,
     uint32                  rlen;
     int                     ret;
     int                     spin;
-    time_t                  deadline;
+    time_t                  deadline = 0;
 
     ret = iox2_client_loan_slice_uninit(client, NULL, &request, total_req);
     if (ret != IOX2_OK)

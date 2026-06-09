@@ -806,6 +806,16 @@ tdb_process_requests_cb(iox2_waitset_attachment_id_h attachment_id,
         resp_len = 0;
         status = wctx->handle_fn(opcode, payload, payload_len,
                                   wctx->resp_buf, wctx->resp_buf_size, &resp_len);
+        if (resp_len > wctx->resp_buf_size)
+        {
+            const char *msg = "response exceeds transport buffer capacity";
+            status = TDB_STATUS_ERROR;
+            resp_len = (uint32_t) strlen(msg);
+            if (resp_len > wctx->resp_buf_size)
+                resp_len = wctx->resp_buf_size;
+            if (resp_len > 0)
+                memcpy(wctx->resp_buf, msg, resp_len);
+        }
 
         total_resp   = (c_size_t)(1 + resp_len);
         response     = NULL;
