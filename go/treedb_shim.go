@@ -578,10 +578,11 @@ func treedb_init(dbPathC *C.char) C.int32_t {
 // req:          request payload bytes (after opcode)
 // reqLen:       length of req
 // respBuf:      caller-allocated output buffer
-// respBufSize:  size of respBuf
-// respLenOut:   receives the number of bytes written into respBuf
+// respBufSize:  size of respBuf; use at least 256 bytes for complete error messages
+// respLenOut:   receives the full response length required, which may exceed respBufSize
 //
-// Returns the status byte (TDB_STATUS_*).
+// Returns the status byte (TDB_STATUS_*). If respBuf is too small, the copied
+// payload is truncated but respLenOut still reports the required length.
 //
 //export treedb_handle
 func treedb_handle(
@@ -602,12 +603,16 @@ func treedb_handle(
 	if respLenOut != nil {
 		*respLenOut = 0
 	}
+	if len(respPayload) > int(respBufSize) {
+		status = statusError
+		respPayload = []byte(fmt.Sprintf("response too large: %d > %d", len(respPayload), uint32(respBufSize)))
+	}
+	if respLenOut != nil {
+		*respLenOut = C.uint32_t(len(respPayload))
+	}
 	if len(respPayload) > 0 && respBuf != nil && respBufSize > 0 {
 		dst := (*[1 << 30]byte)(unsafe.Pointer(respBuf))[:int(respBufSize):int(respBufSize)]
-		n := copy(dst, respPayload)
-		if respLenOut != nil {
-			*respLenOut = C.uint32_t(n)
-		}
+		copy(dst, respPayload)
 	}
 
 	return C.uint8_t(status)

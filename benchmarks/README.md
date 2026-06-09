@@ -1,12 +1,14 @@
 # TreeDB TAM transport baseline harness
 
 This directory contains the repeatable benchmark foundation for GitHub issue #2:
-heap vs the current TreeDB iceoryx Table Access Method path, with checkpointed
-TreeDB readers and artifact guidance suitable for transport comparison PRs.
+heap vs TreeDB Table Access Method transport paths, with checkpointed TreeDB
+readers and artifact guidance suitable for transport comparison PRs.
 
 ## Scope
 
-- Measures PostgreSQL heap and the current TreeDB **iceoryx singleton-owner** path.
+- Measures PostgreSQL heap and TreeDB singleton-owner transports:
+  - `treedb_iceoryx` (default production path);
+  - `treedb_pg_shmem` (opt-in PostgreSQL shared-memory/latch path, when enabled).
 - Uses fresh `pgbench` scale=1 databases by default.
 - Runs the tracker matrix:
   - TPC-B: `pgbench -c 1 -j 1 -T 30`
@@ -17,7 +19,6 @@ TreeDB readers and artifact guidance suitable for transport comparison PRs.
 
 Non-goals for this harness:
 
-- It does **not** implement the PostgreSQL shared-memory transport (#3).
 - It does **not** remove iceoryx.
 - It does **not** make direct-CGO-per-backend a production architecture.
 
@@ -37,6 +38,8 @@ Record the versions in the artifact directory; the script captures these in
 
    ```conf
    shared_preload_libraries = 'treedb_pgext'
+   # Optional for treedb_pg_shmem benchmark runs:
+   # treedb.pg_shmem_enabled = on
    ```
 
 3. Confirm required tools are on `PATH`:
@@ -56,6 +59,7 @@ TDB_BENCH_OUT="$OUT" \
 TDB_BENCH_SCALE=1 \
 TDB_BENCH_TIME=30 \
 TDB_BENCH_CLIENTS="1 2 4 8 16" \
+TDB_BENCH_TRANSPORTS="heap treedb_iceoryx treedb_pg_shmem" \
 benchmarks/treedb_transport_baseline.sh
 ```
 
@@ -68,6 +72,7 @@ To run only one transport while debugging:
 ```bash
 TDB_BENCH_TRANSPORTS="heap" benchmarks/treedb_transport_baseline.sh
 TDB_BENCH_TRANSPORTS="treedb_iceoryx" benchmarks/treedb_transport_baseline.sh
+TDB_BENCH_TRANSPORTS="treedb_pg_shmem" benchmarks/treedb_transport_baseline.sh
 ```
 
 ## Artifacts to attach or cite
@@ -76,7 +81,7 @@ Each run writes:
 
 | Artifact | Contents |
 | --- | --- |
-| `environment.txt` | UTC timestamp, repo and gomap module/git identity, OS, tool versions, libpq env, benchmark env, server version, `shared_preload_libraries` |
+| `environment.txt` | UTC timestamp, repo and gomap module/git identity, OS, tool versions, libpq env, benchmark env, server version, `shared_preload_libraries`, TreeDB transport GUCs |
 | `commands.log` | exact commands executed with shell quoting |
 | `results.tsv` | parsed TPS summary: transport, benchmark, clients/jobs, seconds, scale, TPS, source log |
 | `sum.sql` | the exact SUM scan pgbench script |
@@ -106,13 +111,26 @@ The harness invokes it:
 2. after the c=1 TPC-B write run and before select-only reads;
 3. before the SUM scan matrix.
 
-For manual setup, initialize TreeDB pgbench data with:
+For manual setup, initialize TreeDB pgbench data with the default iceoryx transport:
 
 ```bash
 createdb tam_manual_treedb
 psql -X -v ON_ERROR_STOP=1 -d tam_manual_treedb -c 'CREATE EXTENSION treedb_pgext;'
 env PGOPTIONS='-c default_table_access_method=treedb' pgbench -i -s 1 tam_manual_treedb
 psql -X -v ON_ERROR_STOP=1 -d tam_manual_treedb -c 'SELECT treedb_checkpoint_all();'
+```
+
+For the PG shared-memory transport, start PostgreSQL with
+`treedb.pg_shmem_enabled=on`, then pass transport PGOPTIONS to every setup and
+benchmark command that touches TreeDB:
+
+```bash
+createdb tam_manual_treedb_shmem
+psql -X -v ON_ERROR_STOP=1 -d tam_manual_treedb_shmem -c 'CREATE EXTENSION treedb_pgext;'
+env PGOPTIONS='-c treedb.transport=pg_shmem -c default_table_access_method=treedb' \
+  pgbench -i -s 1 tam_manual_treedb_shmem
+env PGOPTIONS='-c treedb.transport=pg_shmem' \
+  psql -X -v ON_ERROR_STOP=1 -d tam_manual_treedb_shmem -c 'SELECT treedb_checkpoint_all();'
 ```
 
 ## Direct-CGO probe status

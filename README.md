@@ -9,13 +9,13 @@ Tables using this AM store rows in TreeDB instead of PostgreSQL's heap. Point lo
 ```
 PostgreSQL backend (C)
   └─ TAM callbacks (treedb_tam.c)
-       └─ iceoryx2 zero-copy IPC
+       └─ RPC transport: iceoryx2 by default, or opt-in PG shared memory/latches
             └─ Background worker (treedb_bgworker.c)
                  └─ CGO → treedb_shim.so (Go)
                       └─ TreeDB B+tree (per-relation mmap'd file)
 ```
 
-Each backend gets its own iceoryx2 client. The background worker owns the Go runtime and all TreeDB file handles. The worker wakes on a kqueue/epoll event service (notifier+WaitSet) rather than polling, then drains all pending requests in a tight loop.
+The background worker owns the Go runtime and all TreeDB file handles. By default, each backend uses its own iceoryx2 client and the worker wakes on a kqueue/epoll event service (notifier+WaitSet). If `treedb.pg_shmem_enabled=on` is set at postmaster start, sessions can explicitly select `treedb.transport=pg_shmem`; backends then acquire fixed PostgreSQL shared-memory request/response slots and wake the same singleton worker via latches. Iceoryx remains the default and fallback transport.
 
 ## Prerequisites
 
@@ -52,6 +52,8 @@ This builds `treedb_shim.so` (Go, placed in `$(pg_config --pkglibdir)`) and `tre
 
 ```
 shared_preload_libraries = 'treedb_pgext'
+# Optional, only if you want to benchmark/use the PG shared-memory transport:
+# treedb.pg_shmem_enabled = on
 ```
 
 Restart PostgreSQL after changing this.
@@ -76,20 +78,27 @@ SET default_table_access_method = 'treedb';
 
 Standard SQL works as normal — `INSERT`, `UPDATE`, `DELETE`, `SELECT`, indexes, and `TRUNCATE` all work. `DROP TABLE` cleans up TreeDB data atomically on commit.
 
-Row data is stored under `$PGDATA/treedb_data/<relfilenode>/`.
+To opt in to the PostgreSQL shared-memory/latch RPC path for a session after starting the server with `treedb.pg_shmem_enabled=on`:
+
+```sql
+SET treedb.transport = 'pg_shmem';
+```
+
+If shared memory was not enabled at postmaster start, selecting `pg_shmem` fails closed on the first TreeDB RPC. Row data is stored under `$PGDATA/treedb_data/<relfilenode>/`.
 
 ## Benchmarks
 
 Use the repeatable transport baseline harness in
 [`benchmarks/`](benchmarks/README.md) for current numbers and artifact capture.
 The harness records exact commands, environment, result logs, and checkpointed
-TreeDB reader setup for heap vs the current TreeDB iceoryx singleton-owner path:
+TreeDB reader setup for heap vs TreeDB singleton-owner transports:
 
 ```bash
 TDB_BENCH_OUT="artifacts/tam_transport/$(date -u +%Y%m%dT%H%M%SZ)" \
 TDB_BENCH_SCALE=1 \
 TDB_BENCH_TIME=30 \
 TDB_BENCH_CLIENTS="1 2 4 8 16" \
+TDB_BENCH_TRANSPORTS="heap treedb_iceoryx treedb_pg_shmem" \
 benchmarks/treedb_transport_baseline.sh
 ```
 
@@ -105,6 +114,7 @@ singleton TreeDB ownership and collides on TreeDB locks.
 |---|---|---|---|
 | `TDB_SCAN_BATCH_BUF` | `treedb_pgext.h` | 64 KB | Bytes fetched per scan RPC. 32–512 KB all perform similarly; 64 KB minimises memory waste. |
 | `TDB_SPIN_ITERS` | `treedb_pgext.h` | 2048 | ARM `yield` spins before `sched_yield` fallback. 2048 ≈ 10 µs; doubling to 4096 decreased throughput. |
+| `TDB_PG_SHMEM_SLOT_COUNT` | `treedb_bgworker.c` | 64 | Fixed backend request/response slots for the opt-in PG shared-memory transport. |
 
 Only `treedb_pgext` needs recompiling after changing these constants — the Go shim reads `max_bytes` from the request payload at runtime.
 
@@ -121,7 +131,7 @@ A 30 s profile during TPC-B showed: 73% C IPC machinery, 21% Go scheduler (CGO c
 
 ## Limitations
 
-- Single background worker — all backends share one Go runtime and one TreeDB handle per relation; no concurrent writes from multiple backends.
+- Single background worker — all backends share one Go runtime and one TreeDB handle per relation; no internal concurrent TreeDB execution yet.
 - No MVCC — snapshot isolation is not implemented; all reads see the latest committed state.
 - No WAL — crash recovery is not implemented.
 - Sequential scans are ~10× slower than heap for in-memory datasets.
